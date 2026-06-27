@@ -1,0 +1,135 @@
+name: Build linux-kernel clangd index
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的内核版本：tag / commit hash / 分支（如 v6.12）"
+        required: true
+        default: "v6.12"
+      arch:
+        description: "目标架构 ARCH（x86 / arm64 / riscv ...）"
+        required: false
+        default: "x86"
+      config_target:
+        description: "内核配置目标（defconfig / allmodconfig / tinyconfig）。allmodconfig 覆盖最全但很大"
+        required: false
+        default: "defconfig"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: linux
+  SRC_ROOT: /codebase/linux
+  CDB_DIR: /codebase/linux
+  NEED_LVM: "true"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Expand build disk via LVM (对应 ophub README 5.4)
+        if: env.NEED_LVM == 'true'
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
+          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p "${SRC_ROOT}"
+          sudo mount /dev/github/runner "${SRC_ROOT}"
+          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          df -Th
+
+      - name: Install build deps (kernel + clang)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates \
+            build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
+            clang lld llvm dwarves python3
+
+      - name: Download clangd indexing tools
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          url="https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 --retry-delay 2 -o clangd_indexing_tools.zip "${url}"
+          rm -rf clangd_tools && unzip -q clangd_indexing_tools.zip -d clangd_tools
+          indexer="$(find clangd_tools -type f -name clangd-indexer | head -n1)"
+          test -n "${indexer}"
+          # 整体复制工具链，保留 bin/ 与 lib/clang/<ver>/include 的相对结构，
+          # 否则 clangd-indexer 找不到自带头文件（stddef.h 等），报 file not found
+          toolroot="$(dirname "$(dirname "${indexer}")")"
+          sudo cp -rf "${toolroot}/." /usr/local/
+          clangd-indexer --version
+
+      - name: Clone linux @ ${{ inputs.ref }}
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            https://github.com/torvalds/linux.git "${SRC_ROOT}" 2>/dev/null \
+          || { git clone --filter=blob:none https://github.com/torvalds/linux.git "${SRC_ROOT}" \
+               && git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"; }
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Configure & build with clang (生成 .cmd 文件)
+        run: |
+          cd "${SRC_ROOT}"
+          export ARCH="${{ inputs.arch }}" LLVM=1
+          make ${{ inputs.config_target }}
+          ./scripts/config --disable DEBUG_INFO_BTF || true
+          make olddefconfig
+          make -j"$(nproc)"
+
+      - name: Generate compile_commands.json + index (${{ inputs.index_format }})
+        run: |
+          cd "${SRC_ROOT}"
+          make ARCH="${{ inputs.arch }}" LLVM=1 compile_commands.json
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}          # 本工作流不 checkout，gh 需显式指定仓库
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; arch="${{ inputs.arch }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-${arch}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}-${arch}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json"  "${out}/compile_commands.json"
+          git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="${PROJECT}/" \
+              -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
+          cd "${SRC_ROOT}"
+          tar -czf "${out}/${PROJECT}-generated-${safe}-${arch}.tar.gz" \
+              .config include/generated include/config "arch/${arch}/include/generated" 2>/dev/null || true
+          gh release create "${PROJECT}-${safe}-${arch}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} / ${arch} @ ${RESOLVED_SHA})" \
+            --notes "clangd static index for linux ${ref} (ARCH=${arch}, ${{ inputs.config_target }}). project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}-${arch}" /tmp/out/* --clobber

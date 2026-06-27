@@ -1,0 +1,99 @@
+name: Build cpython clangd index
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的版本：commit hash / tag / 分支（如 v3.13.1）"
+        required: true
+        default: "v3.13.1"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: cpython
+  SRC_ROOT: /codebase/cpython
+  CDB_DIR: /codebase/cpython
+  NEED_LVM: "false"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates bear build-essential pkg-config \
+            libssl-dev zlib1g-dev libffi-dev libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev
+
+      - name: Download clangd indexing tools
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          url="https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 --retry-delay 2 -o clangd_indexing_tools.zip "${url}"
+          rm -rf clangd_tools && unzip -q clangd_indexing_tools.zip -d clangd_tools
+          indexer="$(find clangd_tools -type f -name clangd-indexer | head -n1)"
+          test -n "${indexer}"
+          # 整体复制工具链，保留 bin/ 与 lib/clang/<ver>/include 的相对结构，
+          # 否则 clangd-indexer 找不到自带头文件（stddef.h 等），报 file not found
+          toolroot="$(dirname "$(dirname "${indexer}")")"
+          sudo cp -rf "${toolroot}/." /usr/local/
+          clangd-indexer --version
+
+      - name: Clone cpython @ ${{ inputs.ref }}
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          git clone --filter=blob:none https://github.com/python/cpython.git "${SRC_ROOT}"
+          git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Build & export compile_commands.json
+        run: |
+          cd "${SRC_ROOT}"
+          ./configure --with-pydebug
+          bear -- make -j"$(nproc)"
+          test -s "${CDB_DIR}/compile_commands.json"
+
+      - name: Generate index (${{ inputs.index_format }})
+        run: |
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}          # 本工作流不 checkout，gh 需显式指定仓库
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json"  "${out}/compile_commands.json"
+          git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="${PROJECT}/" \
+              -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
+          gh release create "${PROJECT}-${safe}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
+            --notes "clangd static index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}" /tmp/out/* --clobber

@@ -1,0 +1,141 @@
+name: Build PROJECT clangd index
+
+# ============================================================================
+# 通用模板：复制本文件为 build-<项目>-clangd-index.yml，并替换以下 4 处：
+#   1. env.PROJECT        项目短名（用于产物 / Release tag 命名）
+#   2. env.SRC_ROOT       固定构建根目录 /codebase/<项目>（本地消费时路径需一致）
+#   3. env.CDB_DIR        compile_commands.json 所在目录：
+#                           - Makefile/autotools/bear         -> 同 SRC_ROOT
+#                           - CMake / meson / 内核 out-of-tree -> SRC_ROOT/build
+#   4. env.NEED_LVM       大项目（ffmpeg/qemu/postgres/llvm/opencv/grpc...）设 "true"
+#   以及标注 >>> ... <<< 的「依赖安装」「克隆」「构建」三处命令。
+#
+# 索引格式开关 index_format：
+#   - static     ：单体 .idx，clangd 稳定支持，配 Index.External.File 使用（默认）
+#   - background ：.cache/clangd/index 分片，需较新 clangd（--format=background，
+#                  见 llvm PR #175209），便于 clangd-remap 跨平台重写路径
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的版本：commit hash / tag / 分支"
+        required: true
+        default: "DEFAULT_REF"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: PROJECT_NAME
+  SRC_ROOT: /codebase/PROJECT_NAME
+  CDB_DIR: /codebase/PROJECT_NAME          # CMake/meson 改为 /codebase/PROJECT_NAME/build
+  NEED_LVM: "false"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Expand build disk via LVM (对应 ophub README 5.4)
+        if: env.NEED_LVM == 'true'
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
+          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p "${SRC_ROOT}"
+          sudo mount /dev/github/runner "${SRC_ROOT}"
+          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          df -Th
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          # >>> PROJECT DEPS <<<
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates bear build-essential pkg-config
+
+      - name: Download clangd indexing tools
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          url="https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 --retry-delay 2 -o clangd_indexing_tools.zip "${url}"
+          rm -rf clangd_tools && unzip -q clangd_indexing_tools.zip -d clangd_tools
+          indexer="$(find clangd_tools -type f -name clangd-indexer | head -n1)"
+          test -n "${indexer}"
+          # 整体复制工具链，保留 bin/ 与 lib/clang/<ver>/include 的相对结构，
+          # 否则 clangd-indexer 找不到自带头文件（stddef.h 等），报 file not found
+          toolroot="$(dirname "$(dirname "${indexer}")")"
+          sudo cp -rf "${toolroot}/." /usr/local/
+          clangd-indexer --version
+
+      - name: Clone source @ ${{ inputs.ref }}
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          # >>> REPO_URL <<<
+          git clone --filter=blob:none https://github.com/OWNER/REPO.git "${SRC_ROOT}"
+          git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
+          # 若有子模块：git -C "${SRC_ROOT}" submodule update --init --recursive --depth 1
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Build & export compile_commands.json
+        run: |
+          cd "${SRC_ROOT}"
+          # >>> PROJECT BUILD BLOCK <<<
+          bear -- make -j"$(nproc)"
+          test -s "${CDB_DIR}/compile_commands.json"
+
+      - name: Generate index (${{ inputs.index_format }})
+        run: |
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}          # 本工作流不 checkout，gh 需显式指定仓库
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json" "${out}/compile_commands.json"
+          git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="${PROJECT}/" \
+              -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
+          # 生成头文件快照（CMake/meson 的 build 头文件；本地解析必需）
+          if [ "${CDB_DIR}" != "${SRC_ROOT}" ]; then
+            tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
+                --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' --exclude='*.dylib' \
+                -C "${SRC_ROOT}" "$(basename "${CDB_DIR}")"
+          fi
+          gh release create "${PROJECT}-${safe}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
+            --notes "clangd ${{ inputs.index_format }} index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}" /tmp/out/* --clobber
