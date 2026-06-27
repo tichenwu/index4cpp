@@ -1,0 +1,114 @@
+name: Build rocksdb clangd index
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的版本：commit hash / tag / 分支（如 v9.7.4）"
+        required: true
+        default: "v9.7.4"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: rocksdb
+  SRC_ROOT: /codebase/rocksdb
+  CDB_DIR: /codebase/rocksdb/build
+  NEED_LVM: "true"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Expand build disk via LVM (对应 ophub README 5.4)
+        if: env.NEED_LVM == 'true'
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
+          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p "${SRC_ROOT}"
+          sudo mount /dev/github/runner "${SRC_ROOT}"
+          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          df -Th
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates build-essential pkg-config \
+            cmake ninja-build libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
+
+      - name: Download clangd indexing tools
+        run: |
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          wget -q "https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          unzip -q "clangd_indexing_tools-linux-${ver}.zip"
+          sudo cp -f "clangd_indexing_tools-${ver}/bin/"* /usr/local/bin/
+          clangd-indexer --version || true
+
+      - name: Clone rocksdb @ ${{ inputs.ref }}
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          git clone --filter=blob:none https://github.com/facebook/rocksdb.git "${SRC_ROOT}"
+          git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Configure & build (CMake 原生导出 compile_commands.json)
+        run: |
+          cd "${SRC_ROOT}"
+          cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DWITH_GFLAGS=ON -DWITH_SNAPPY=ON -DWITH_LZ4=ON -DWITH_ZSTD=ON -DWITH_BZ2=ON \
+            -DWITH_TESTS=OFF -DWITH_BENCHMARK_TOOLS=OFF
+          cmake --build build -j"$(nproc)"
+          test -s "${CDB_DIR}/compile_commands.json"
+
+      - name: Generate index (${{ inputs.index_format }})
+        run: |
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json"  "${out}/compile_commands.json"
+          git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="${PROJECT}/" \
+              -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
+          tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
+              --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' --exclude='*.dylib' \
+              -C "${SRC_ROOT}" build
+          gh release create "${PROJECT}-${safe}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
+            --notes "clangd static index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}" /tmp/out/* --clobber

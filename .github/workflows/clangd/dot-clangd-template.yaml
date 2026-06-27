@@ -1,0 +1,23 @@
+# ============================================================================
+# 单项目 .clangd 模板
+# 用法：把本文件复制到项目根目录并改名为 .clangd
+#       将 <PROJECT> 替换为项目短名（如 nginx / redis / llvm ...）
+#
+# 前提（路径对齐，导航/补全全部可用 —— 推荐 WSL）：
+#   1) 把 Release 里的源码快照解压到与构建一致的路径 /codebase/<PROJECT>
+#   2) CMake/meson 项目再解压 *-generated-*.tar.gz 到 /codebase/<PROJECT>（恢复 build/）
+#   3) 把 <PROJECT>-<ref>.idx 重命名为 /codebase/<PROJECT>/<PROJECT>.idx
+#
+# CompilationDatabase 取值：
+#   - Makefile / autotools / 内核：/codebase/<PROJECT>
+#   - CMake / meson：             /codebase/<PROJECT>/build
+# ============================================================================
+
+CompileFlags:
+  CompilationDatabase: /codebase/<PROJECT>          # CMake/meson 改为 /codebase/<PROJECT>/build
+
+Index:
+  External:
+    File: /codebase/<PROJECT>/<PROJECT>.idx
+    MountPoint: /codebase/<PROJECT>
+  Background: Skip                                   # 已有完整静态索引，关闭后台索引省 CPU

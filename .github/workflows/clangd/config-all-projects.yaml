@@ -1,0 +1,179 @@
+# ============================================================================
+# clangd 全局用户配置：一份配置覆盖全部 15 个项目
+#
+# 放置位置：
+#   Linux / WSL : ~/.config/clangd/config.yaml
+#   macOS       : ~/Library/Preferences/clangd/config.yaml
+#   Windows     : %LocalAppData%\clangd\config.yaml
+#
+# 约定（关键）：每个项目本地都解压到 /codebase/<项目>，与 Actions 构建路径一致
+#   → 路径完全对齐，跳转 / 补全 / 查引用全部可用（推荐在 WSL 中使用）。
+#   每个项目准备：
+#     - 源码快照解压到 /codebase/<项目>
+#     - CMake/meson 项目再解压 *-generated-*.tar.gz 恢复 build/
+#     - 把 <项目>-<ref>.idx 重命名为 /codebase/<项目>/<项目>.idx
+#
+# 每段用 If.PathMatch 限定只对该项目目录生效，互不干扰。
+#
+# 原生 Windows 用户：把 /codebase/<项目> 换成你的本地盘路径（如 C:/codebase/<项目>），
+#   但 idx 内是 Linux 路径，跳转到“索引内符号”可能失效（补全/搜索仍可用）；
+#   需要完整导航请改用 clangd-index-server（--project-root=/codebase/<项目>）+ 同名 MountPoint。
+# ============================================================================
+Index:
+    StandardLibrary: No
+    Background: Skip
+Diagnostics:
+    UnusedIncludes: Strict # Enables include cleaner’s unused includes diagnostics
+Hover:
+    ShowAKA: Yes # print desugared types, e.g: vector<int>::value_type (aka int)
+InlayHints:
+    Enabled: No # control inlay prints, can be useful but make code harder to read; disabled by default; feel free to experiment
+    ParameterNames: Yes # inlay-hints for parameter names in function calls.
+    DeducedTypes: Yes # inlay-hints for deduced types.
+    Designators: Yes # inlay-hints for index designators in aggregate initialization
+---
+If:
+  PathMatch: /codebase/nginx/.*
+CompileFlags:
+  CompilationDatabase: /codebase/nginx
+Index:
+  External:
+    File: /codebase/nginx/nginx.idx
+    MountPoint: /codebase/nginx
+---
+If:
+  PathMatch: /codebase/linux/.*
+CompileFlags:
+  CompilationDatabase: /codebase/linux
+Index:
+  External:
+    File: /codebase/linux/linux.idx
+    MountPoint: /codebase/linux
+---
+If:
+  PathMatch: /codebase/llvm-project/.*
+CompileFlags:
+  CompilationDatabase: /codebase/llvm-project/build
+Index:
+  External:
+    File: /codebase/llvm-project/llvm.idx
+    MountPoint: /codebase/llvm-project
+---
+If:
+  PathMatch: /codebase/redis/.*
+CompileFlags:
+  CompilationDatabase: /codebase/redis
+Index:
+  External:
+    File: /codebase/redis/redis.idx
+    MountPoint: /codebase/redis
+---
+If:
+  PathMatch: /codebase/git/.*
+CompileFlags:
+  CompilationDatabase: /codebase/git
+Index:
+  External:
+    File: /codebase/git/git.idx
+    MountPoint: /codebase/git
+---
+If:
+  PathMatch: /codebase/postgresql/.*
+CompileFlags:
+  CompilationDatabase: /codebase/postgresql
+Index:
+  External:
+    File: /codebase/postgresql/postgresql.idx
+    MountPoint: /codebase/postgresql
+---
+If:
+  PathMatch: /codebase/cpython/.*
+CompileFlags:
+  CompilationDatabase: /codebase/cpython
+Index:
+  External:
+    File: /codebase/cpython/cpython.idx
+    MountPoint: /codebase/cpython
+---
+If:
+  PathMatch: /codebase/ffmpeg/.*
+CompileFlags:
+  CompilationDatabase: /codebase/ffmpeg
+Index:
+  External:
+    File: /codebase/ffmpeg/ffmpeg.idx
+    MountPoint: /codebase/ffmpeg
+---
+If:
+  PathMatch: /codebase/curl/.*
+CompileFlags:
+  CompilationDatabase: /codebase/curl
+Index:
+  External:
+    File: /codebase/curl/curl.idx
+    MountPoint: /codebase/curl
+---
+If:
+  PathMatch: /codebase/qemu/.*
+CompileFlags:
+  CompilationDatabase: /codebase/qemu/build
+Index:
+  External:
+    File: /codebase/qemu/qemu.idx
+    MountPoint: /codebase/qemu
+---
+If:
+  PathMatch: /codebase/rocksdb/.*
+CompileFlags:
+  CompilationDatabase: /codebase/rocksdb/build
+Index:
+  External:
+    File: /codebase/rocksdb/rocksdb.idx
+    MountPoint: /codebase/rocksdb
+---
+If:
+  PathMatch: /codebase/opencv/.*
+CompileFlags:
+  CompilationDatabase: /codebase/opencv/build
+Index:
+  External:
+    File: /codebase/opencv/opencv.idx
+    MountPoint: /codebase/opencv
+---
+If:
+  PathMatch: /codebase/protobuf/.*
+CompileFlags:
+  CompilationDatabase: /codebase/protobuf/build
+Index:
+  External:
+    File: /codebase/protobuf/protobuf.idx
+    MountPoint: /codebase/protobuf
+---
+If:
+  PathMatch: /codebase/leveldb/.*
+CompileFlags:
+  CompilationDatabase: /codebase/leveldb/build
+Index:
+  External:
+    File: /codebase/leveldb/leveldb.idx
+    MountPoint: /codebase/leveldb
+---
+If:
+  PathMatch: /codebase/grpc/.*
+  PathExclude: [/codebase/grpc/.*/ut/.*] # excludes specific files that match path in the previous line
+CompileFlags:
+  Add: [-DUNIT_TEST]
+  CompilationDatabase: /codebase/grpc/build
+Index:
+  External:
+    File: /codebase/grpc/grpc.idx
+    MountPoint: /codebase/grpc
+---
+If:
+    PathMatch: [.*/llvm-project/.*] # if the file path match, consider following settings
+CompileFlags:
+    CompilationDatabase: /var/fpwork/tichen/llvm-project/build
+Index:
+    External: # defines remote index server
+        Server: clangd-index.llvm.org:5900
+        MountPoint: /var/fpwork/tichen/llvm-project

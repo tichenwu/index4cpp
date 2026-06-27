@@ -1,0 +1,132 @@
+name: Build llvm-project clangd index
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的版本：tag / commit hash / 分支（如 llvmorg-19.1.7 或 main）"
+        required: true
+        default: "llvmorg-19.1.7"
+      llvm_projects:
+        description: "子项目 LLVM_ENABLE_PROJECTS（如 clang / 'clang;lld'）"
+        required: false
+        default: "clang"
+      llvm_targets:
+        description: "构建的后端 LLVM_TARGETS_TO_BUILD（X86 / AArch64 / 'X86;AArch64' / all）"
+        required: false
+        default: "X86"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: llvm
+  SRC_ROOT: /codebase/llvm-project
+  CDB_DIR: /codebase/llvm-project/build
+  NEED_LVM: "true"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Expand build disk via LVM (对应 ophub README 5.4)
+        if: env.NEED_LVM == 'true'
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
+          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p "${SRC_ROOT}"
+          sudo mount /dev/github/runner "${SRC_ROOT}"
+          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          df -Th
+
+      - name: Install build deps (cmake / ninja / clang / lld)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates \
+            cmake ninja-build clang lld llvm python3
+
+      - name: Download clangd indexing tools
+        run: |
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          wget -q "https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          unzip -q "clangd_indexing_tools-linux-${ver}.zip"
+          sudo cp -f "clangd_indexing_tools-${ver}/bin/"* /usr/local/bin/
+          clangd-indexer --version || true
+
+      - name: Clone llvm-project @ ${{ inputs.ref }}
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          git clone --depth 1 --branch "${{ inputs.ref }}" \
+            https://github.com/llvm/llvm-project.git "${SRC_ROOT}" 2>/dev/null \
+          || { git clone --filter=blob:none https://github.com/llvm/llvm-project.git "${SRC_ROOT}" \
+               && git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"; }
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Configure (CMake 原生导出 compile_commands.json)
+        run: |
+          cd "${SRC_ROOT}"
+          cmake -G Ninja -S llvm -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DLLVM_ENABLE_PROJECTS="${{ inputs.llvm_projects }}" \
+            -DLLVM_TARGETS_TO_BUILD="${{ inputs.llvm_targets }}" \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLVM_USE_LINKER=lld
+
+      - name: Build (产出 TableGen 生成头文件)
+        run: |
+          cd "${SRC_ROOT}"
+          ninja -C build
+
+      - name: Generate index (${{ inputs.index_format }})
+        run: |
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json"  "${out}/compile_commands.json"
+          git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="llvm-project/" \
+              -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
+          tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
+              --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' \
+              --exclude='bin' --exclude='lib' \
+              -C "${SRC_ROOT}" build
+          gh release create "${PROJECT}-${safe}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
+            --notes "clangd static index for llvm-project ${ref} (projects=${{ inputs.llvm_projects }}, targets=${{ inputs.llvm_targets }}). project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}" /tmp/out/* --clobber
