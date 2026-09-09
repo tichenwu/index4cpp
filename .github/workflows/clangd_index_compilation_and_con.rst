@@ -1110,7 +1110,7 @@ bear -- make -j"$(nproc)"
 
 ### 6. curl（C / autotools）
 - `REPO_URL` `https://github.com/curl/curl.git`，`DEFAULT_REF` `curl-8_11_0`
-- DEPS：`bear build-essential autoconf automake libtool pkg-config libssl-dev`
+- DEPS：`bear build-essential autoconf automake libtool pkg-config libssl-dev libpsl-dev`
 - CDB_DIR：`/opt/src`，NEED_LVM：false
 - BUILD：
 ```bash

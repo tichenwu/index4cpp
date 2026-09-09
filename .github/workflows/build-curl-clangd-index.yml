@@ -34,7 +34,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git wget unzip ca-certificates bear build-essential pkg-config \
-            autoconf automake libtool libssl-dev
+            autoconf automake libtool libssl-dev libpsl-dev
 
       - name: Download clangd indexing tools
         run: |
