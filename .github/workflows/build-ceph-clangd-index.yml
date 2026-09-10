@@ -51,18 +51,31 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
+          # ubuntu-22.04 runner 预装 LLVM 的 libunwind-N-dev，与发行版
+          # libunwind-dev 冲突，导致 libgoogle-perftools-dev 无法安装。
+          llvm_unwind=$(dpkg-query -W -f='${Package}\n' 'libunwind-*-dev' 2>/dev/null || true)
+          if [ -n "${llvm_unwind}" ]; then
+            sudo apt-get remove -y ${llvm_unwind}
+          fi
           sudo apt-get install -y --no-install-recommends \
             git wget unzip ca-certificates curl build-essential pkg-config \
             cmake ninja-build ccache python3 python3-dev python3-pip \
             libssl-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev \
             libaio-dev libbabeltrace-dev libblkid-dev libboost-all-dev \
             libcap-ng-dev libcryptsetup-dev libcurl4-openssl-dev libdw-dev \
-            libedit-dev libexpat1-dev libfuse3-dev libgoogle-perftools-dev \
+            libedit-dev libexpat1-dev libfuse3-dev libunwind-dev \
+            libgoogle-perftools-dev \
             libkeyutils-dev libldap2-dev liblua5.3-dev libncurses-dev \
             libnl-3-dev libnl-genl-3-dev libnuma-dev liboath-dev \
             librabbitmq-dev libradosstriper-dev librbd-dev librdmacm-dev \
             libsasl2-dev libsqlite3-dev libssl-dev libtool libudev-dev \
-            libxml2-dev libyaml-cpp-dev nasm uuid-dev valgrind
+            libxml2-dev libyaml-cpp-dev nasm uuid-dev valgrind python3-sphinx \
+            liblttng-ust-dev lttng-tools \
+            libthrift-dev \
+            libfmt-dev nlohmann-json3-dev libre2-dev librdkafka-dev \
+            libnss3-dev libibverbs-dev xfslibs-dev libutf8proc-dev \
+            libevent-dev libcap-dev libcunit1-dev libicu-dev \
+            bison flex gperf cython3
 
       - name: Download clangd indexing tools
         run: |
@@ -90,8 +103,13 @@ jobs:
         run: |
           cd "${SRC_ROOT}"
           DEBIAN_FRONTEND=noninteractive sudo -E ./install-deps.sh || true
-          ARGS="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_TESTS=OFF" \
-            ./do_cmake.sh
+          # do_cmake.sh 会把 ARGS 重置为 -GNinja，额外 -D 必须走脚本参数 "$@"
+          ./do_cmake.sh \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DWITH_TESTS=OFF \
+            -DWITH_MANPAGE=OFF \
+            -DWITH_MGR_DASHBOARD_FRONTEND=OFF
           test -s "${CDB_DIR}/compile_commands.json"
 
       - name: Partial build (生成头文件，允许部分失败)

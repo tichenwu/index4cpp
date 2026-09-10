@@ -1,12 +1,12 @@
-name: Build kudu clangd index
+name: Build glusterfs clangd index
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "要编译的版本：commit hash / tag / 分支"
+        description: "要编译的版本：commit hash / tag / 分支（如 v11.2、release-11、devel）"
         required: true
-        default: "master"
+        default: "v11.2"
       clangd_version:
         description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
         required: false
@@ -20,43 +20,30 @@ permissions:
   contents: write
 
 env:
-  PROJECT: kudu
-  SRC_ROOT: /codebase/kudu
-  CDB_DIR: /codebase/kudu/build
-  NEED_LVM: "true"
+  PROJECT: glusterfs
+  SRC_ROOT: /codebase/glusterfs
+  CDB_DIR: /codebase/glusterfs
+  NEED_LVM: "false"
 
 jobs:
   build-index:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
     steps:
-      - name: Expand build disk via LVM (对应 ophub README 5.4)
-        if: env.NEED_LVM == 'true'
-        run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
-          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
-          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
-          sudo truncate -s "${root_size}"G /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs /dev/github/runner
-          sudo mkdir -p "${SRC_ROOT}"
-          sudo mount /dev/github/runner "${SRC_ROOT}"
-          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
-          df -Th
-
       - name: Install build deps
         run: |
           sudo apt-get update
+          # ubuntu-22.04 runner 预装 LLVM 的 libunwind-N-dev，与发行版
+          # libunwind-dev 冲突，导致 libgoogle-perftools-dev（tcmalloc）装不上。
+          llvm_unwind=$(dpkg-query -W -f='${Package}\n' 'libunwind-*-dev' 2>/dev/null || true)
+          if [ -n "${llvm_unwind}" ]; then
+            sudo apt-get remove -y ${llvm_unwind}
+          fi
           sudo apt-get install -y --no-install-recommends \
-            git wget unzip ca-certificates curl build-essential pkg-config \
-            cmake ninja-build autoconf automake libtool \
-            libboost-all-dev libgflags-dev libgoogle-glog-dev libsnappy-dev \
-            libssl-dev libunwind-dev liblz4-dev libzstd-dev zlib1g-dev \
-            libprotobuf-dev protobuf-compiler python3
+            git wget unzip ca-certificates curl bear build-essential pkg-config \
+            autoconf automake libtool flex bison python3 \
+            libaio-dev libssl-dev libxml2-dev liblvm2-dev liburcu-dev \
+            libglib2.0-dev libtirpc-dev uuid-dev \
+            libunwind-dev libgoogle-perftools-dev
 
       - name: Download clangd indexing tools
         run: |
@@ -72,21 +59,19 @@ jobs:
           sudo cp -rf "${toolroot}/." /usr/local/
           clangd-indexer --version
 
-      - name: Clone kudu @ ${{ inputs.ref }}
+      - name: Clone glusterfs @ ${{ inputs.ref }}
         run: |
           sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
-          git clone --filter=blob:none https://github.com/apache/kudu.git "${SRC_ROOT}"
+          git clone --filter=blob:none https://github.com/gluster/glusterfs.git "${SRC_ROOT}"
           git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
           echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
 
-      - name: Configure & build (CMake 原生导出 compile_commands.json)
+      - name: Build & export compile_commands.json
         run: |
           cd "${SRC_ROOT}"
-          cmake -G Ninja -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DKUDU_LINK_TESTING=OFF -DKUDU_CLIENT_TESTING=OFF \
-            -DKUDU_TCMALLOC_AVAILABLE=OFF
-          cmake --build build -j"$(nproc)" || true
+          ./autogen.sh
+          ./configure --disable-glusterfs-3_1-syntax-compat
+          bear -- make -j"$(nproc)"
           test -s "${CDB_DIR}/compile_commands.json"
 
       - name: Generate index (${{ inputs.index_format }})
@@ -116,9 +101,6 @@ jobs:
           cp "${CDB_DIR}/compile_commands.json" "${out}/compile_commands.json"
           git -C "${SRC_ROOT}" archive --format=tar.gz --prefix="${PROJECT}/" \
               -o "${out}/${PROJECT}-src-${safe}.tar.gz" HEAD
-          tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
-              --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' --exclude='*.dylib' \
-              -C "${SRC_ROOT}" build
           gh release create "${PROJECT}-${safe}" /tmp/out/* \
             --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
             --notes "clangd index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \

@@ -61,8 +61,13 @@ jobs:
       - name: Build & export compile_commands.json
         run: |
           cd "${SRC_ROOT}"
-          ./linux-bootstrap.sh
+          # 仓库已提交 configure（无 linux-bootstrap.sh）；官方 linux_build.sh
+          # 内部是 configure+make，这里拆开以便 bear 拦截编译命令。
           ./configure --prefix=/usr
+          # 仓库用 automake 1.18 生成；ubuntu-22.04 只有 1.16。
+          # git 检出后时间戳乱序会让 make 试图调用 aclocal-1.18。
+          find . \( -name aclocal.m4 -o -name configure -o -name config.h.in \
+                 -o -name Makefile.in \) -exec touch {} +
           bear -- make -j"$(nproc)"
           test -s "${CDB_DIR}/compile_commands.json"
 

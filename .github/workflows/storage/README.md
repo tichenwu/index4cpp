@@ -254,8 +254,8 @@
 | 项目 | 工作流 | 构建系统 | LVM | CDB 目录 | 默认 ref | 备注 |
 |------|--------|----------|-----|----------|----------|------|
 | ceph | `build-ceph-clangd-index.yml` | cmake + do_cmake.sh | 是 | `/codebase/ceph/build` | `reef` | 构建耗时长，子模块多 |
-| braft | `build-braft-clangd-index.yml` | cmake + 子模块 | 否 | `/codebase/braft/build` | `master` | 依赖 brpc 子模块 |
-| glusterfs | `build-glusterfs-clangd-index.yml` | autotools + bear | 否 | `/codebase/glusterfs` | `v11` | |
+| braft | `build-braft-clangd-index.yml` | cmake（先编译安装 brpc） | 否 | `/codebase/braft/build` | `master` | brpc 是系统依赖，不是 git 子模块 |
+| glusterfs | `build-glusterfs-clangd-index.yml` | autotools + bear | 否 | `/codebase/glusterfs` | `v11.2` | tag 是 `v11.2`，没有 `v11` |
 | moosefs | `build-moosefs-clangd-index.yml` | autotools + bear | 否 | `/codebase/moosefs` | `master` | |
 | kudu | `build-kudu-clangd-index.yml` | cmake | 是 | `/codebase/kudu/build` | `master` | |
 
