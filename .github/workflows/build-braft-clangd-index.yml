@@ -34,8 +34,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git wget unzip ca-certificates curl build-essential pkg-config \
-            cmake ninja-build libgflags-dev libprotobuf-dev protobuf-compiler \
-            libssl-dev libleveldb-dev libsnappy-dev zlib1g-dev
+            cmake ninja-build libgflags-dev libprotobuf-dev libprotoc-dev \
+            protobuf-compiler libssl-dev libleveldb-dev libsnappy-dev zlib1g-dev
 
       - name: Download clangd indexing tools
         run: |
@@ -51,20 +51,54 @@ jobs:
           sudo cp -rf "${toolroot}/." /usr/local/
           clangd-indexer --version
 
-      - name: Clone braft @ ${{ inputs.ref }} (含子模块 brpc)
+      - name: Clone braft @ ${{ inputs.ref }}
         run: |
           sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
           git clone --filter=blob:none https://github.com/baidu/braft.git "${SRC_ROOT}"
           git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
-          git -C "${SRC_ROOT}" submodule update --init --recursive --depth 1
           echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+          # brpc >= 1.16：在 namespace bvar::detail 里写 detail::Sample 会解析成
+          # 不存在的 bvar::detail::detail::Sample（上游 PR baidu/braft#525 尚未合入）。
+          # 不要用 /get_window_recorder_qps/,/get_span/ 做范围替换：构造函数
+          # `_qps(get_window_recorder_qps, ...)` 会再次打开该范围，把
+          # CounterRecorder::qps（位于 namespace bvar，不在 detail 内）里
+          # 本应保留的 detail::Sample 也改成 Sample，导致 Sample<Stat> 被当成比较运算。
+          # 两处都改成完全限定名，在两个 namespace 里都能正确解析。
+          sed -i 's/detail::Sample<Stat>/::bvar::detail::Sample<Stat>/g' \
+            "${SRC_ROOT}/src/braft/util.cpp"
+          test "$(grep -c 'Sample<Stat> s;' "${SRC_ROOT}/src/braft/util.cpp")" -eq 2
+          if grep -nE '[^:]detail::Sample<Stat>' "${SRC_ROOT}/src/braft/util.cpp"; then
+            echo "leftover ambiguous detail::Sample<Stat> in util.cpp" >&2
+            exit 1
+          fi
+
+      # braft 没有 brpc 子模块；CMake 用 find_path/find_library 找已安装的 brpc
+      # （brpc/server.h、libbrpc.a）。官方 CI 同样是先 clone + cmake install brpc。
+      - name: Build & install brpc
+        run: |
+          set -euo pipefail
+          prefix="${SRC_ROOT}/deps"
+          git clone --filter=blob:none --depth 1 https://github.com/apache/brpc.git /tmp/brpc
+          cmake -G Ninja -S /tmp/brpc -B /tmp/brpc/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${prefix}" \
+            -DWITH_DEBUG_SYMBOLS=OFF
+          cmake --build /tmp/brpc/build -j"$(nproc)"
+          cmake --install /tmp/brpc/build
+          test -f "${prefix}/include/brpc/server.h"
+          libbrpc="$(find "${prefix}" \( -name 'libbrpc.a' -o -name 'libbrpc.so' \) | head -n1)"
+          test -n "${libbrpc}"
+          echo "BRPC_LIB=${libbrpc}" >> "${GITHUB_ENV}"
 
       - name: Configure & build (CMake 原生导出 compile_commands.json)
         run: |
           cd "${SRC_ROOT}"
           cmake -G Ninja -S . -B build \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DBRAFT_BUILD_UNIT_TESTS=OFF
+            -DCMAKE_PREFIX_PATH="${SRC_ROOT}/deps" \
+            -DBRPC_INCLUDE_PATH="${SRC_ROOT}/deps/include" \
+            -DBRPC_LIB="${BRPC_LIB}" \
+            -DBUILD_UNIT_TESTS=OFF
           cmake --build build -j"$(nproc)"
           test -s "${CDB_DIR}/compile_commands.json"
 
@@ -94,11 +128,11 @@ jobs:
           fi
           cp "${CDB_DIR}/compile_commands.json" "${out}/compile_commands.json"
           tar -czf "${out}/${PROJECT}-src-${safe}.tar.gz" \
-              --exclude='.git' --exclude='build' \
+              --exclude='.git' --exclude='build' --exclude='deps' \
               -C "$(dirname "${SRC_ROOT}")" "$(basename "${SRC_ROOT}")"
           tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
               --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' --exclude='*.dylib' \
-              -C "${SRC_ROOT}" build
+              -C "${SRC_ROOT}" build deps
           gh release create "${PROJECT}-${safe}" /tmp/out/* \
             --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
             --notes "clangd index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
