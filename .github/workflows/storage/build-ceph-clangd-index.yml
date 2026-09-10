@@ -1,0 +1,137 @@
+name: Build ceph clangd index
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要编译的版本：commit hash / tag / 分支（如 reef、v19.2.0）"
+        required: true
+        default: "reef"
+      clangd_version:
+        description: "clangd / indexing tools 版本（务必与本地 clangd 主版本一致）"
+        required: false
+        default: "19.1.2"
+      index_format:
+        description: "索引格式：static（单体 .idx，当前稳定）| background（.cache 分片，需较新 clangd，便于 clangd-remap 跨平台）"
+        required: false
+        default: "static"
+
+permissions:
+  contents: write
+
+env:
+  PROJECT: ceph
+  SRC_ROOT: /codebase/ceph
+  CDB_DIR: /codebase/ceph/build
+  NEED_LVM: "true"
+
+jobs:
+  build-index:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Expand build disk via LVM (对应 ophub README 5.4)
+        if: env.NEED_LVM == 'true'
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 1)
+          root_size=$(expr $(df -h /   | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g;s/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs /dev/github/runner
+          sudo mkdir -p "${SRC_ROOT}"
+          sudo mount /dev/github/runner "${SRC_ROOT}"
+          sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          df -Th
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget unzip ca-certificates curl build-essential pkg-config \
+            cmake ninja-build ccache python3 python3-dev python3-pip \
+            libssl-dev libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev \
+            libaio-dev libbabeltrace-dev libblkid-dev libboost-all-dev \
+            libcap-ng-dev libcryptsetup-dev libcurl4-openssl-dev libdw-dev \
+            libedit-dev libexpat1-dev libfuse3-dev libgoogle-perftools-dev \
+            libkeyutils-dev libldap2-dev liblua5.3-dev libncurses-dev \
+            libnl-3-dev libnl-genl-3-dev libnuma-dev liboath-dev \
+            librabbitmq-dev libradosstriper-dev librbd-dev librdmacm-dev \
+            libsasl2-dev libsqlite3-dev libssl-dev libtool libudev-dev \
+            libxml2-dev libyaml-cpp-dev nasm uuid-dev valgrind
+
+      - name: Download clangd indexing tools
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.clangd_version }}"; cd /tmp
+          url="https://github.com/clangd/clangd/releases/download/${ver}/clangd_indexing_tools-linux-${ver}.zip"
+          echo "Downloading ${url}"
+          curl -fL --retry 3 --retry-delay 2 -o clangd_indexing_tools.zip "${url}"
+          rm -rf clangd_tools && unzip -q clangd_indexing_tools.zip -d clangd_tools
+          indexer="$(find clangd_tools -type f -name clangd-indexer | head -n1)"
+          test -n "${indexer}"
+          toolroot="$(dirname "$(dirname "${indexer}")")"
+          sudo cp -rf "${toolroot}/." /usr/local/
+          clangd-indexer --version
+
+      - name: Clone ceph @ ${{ inputs.ref }} (含子模块)
+        run: |
+          sudo mkdir -p "${SRC_ROOT}"; sudo chown -R "$USER:$USER" "${SRC_ROOT}"
+          git clone --filter=blob:none https://github.com/ceph/ceph.git "${SRC_ROOT}"
+          git -C "${SRC_ROOT}" checkout --force "${{ inputs.ref }}"
+          git -C "${SRC_ROOT}" submodule update --init --recursive --depth 1
+          echo "RESOLVED_SHA=$(git -C "${SRC_ROOT}" rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Install ceph deps & configure (do_cmake.sh)
+        run: |
+          cd "${SRC_ROOT}"
+          DEBIAN_FRONTEND=noninteractive sudo -E ./install-deps.sh || true
+          ARGS="-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWITH_TESTS=OFF" \
+            ./do_cmake.sh
+          test -s "${CDB_DIR}/compile_commands.json"
+
+      - name: Partial build (生成头文件，允许部分失败)
+        run: |
+          cd "${CDB_DIR}"
+          ninja -k 100 ceph-common librados librbd || true
+          test -s compile_commands.json
+
+      - name: Generate index (${{ inputs.index_format }})
+        run: |
+          test -s "${CDB_DIR}/compile_commands.json"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            ( cd "${CDB_DIR}" && clangd-indexer --format=background --executor=all-TUs compile_commands.json )
+            tar -czf "/tmp/${PROJECT}-bgindex.tar.gz" -C "${CDB_DIR}" .cache/clangd/index
+            ls -lh "/tmp/${PROJECT}-bgindex.tar.gz"
+          else
+            clangd-indexer --executor=all-TUs "${CDB_DIR}/compile_commands.json" > "/tmp/${PROJECT}.idx"
+            ls -lh "/tmp/${PROJECT}.idx"
+          fi
+
+      - name: Package + publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          out=/tmp/out; mkdir -p "${out}"
+          ref="${{ inputs.ref }}"; safe="${ref//\//_}"
+          if [ "${{ inputs.index_format }}" = "background" ]; then
+            cp "/tmp/${PROJECT}-bgindex.tar.gz" "${out}/${PROJECT}-${safe}-bgindex.tar.gz"
+          else
+            cp "/tmp/${PROJECT}.idx" "${out}/${PROJECT}-${safe}.idx"
+          fi
+          cp "${CDB_DIR}/compile_commands.json" "${out}/compile_commands.json"
+          tar -czf "${out}/${PROJECT}-src-${safe}.tar.gz" \
+              --exclude='.git' --exclude='build' \
+              -C "$(dirname "${SRC_ROOT}")" "$(basename "${SRC_ROOT}")"
+          tar -czf "${out}/${PROJECT}-generated-${safe}.tar.gz" \
+              --exclude='*.o' --exclude='*.a' --exclude='*.so*' --exclude='*.obj' --exclude='*.dylib' \
+              -C "${SRC_ROOT}" build
+          gh release create "${PROJECT}-${safe}" /tmp/out/* \
+            --title "${PROJECT} clangd index (${ref} @ ${RESOLVED_SHA})" \
+            --notes "clangd index for ${PROJECT} ${ref}. project-root=${SRC_ROOT}, clangd tools=${{ inputs.clangd_version }}." \
+          || gh release upload "${PROJECT}-${safe}" /tmp/out/* --clobber

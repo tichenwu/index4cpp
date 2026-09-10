@@ -1,0 +1,69 @@
+# ============================================================================
+# clangd 配置片段：分布式存储方向 C/C++ 项目
+#
+# 合并方式：将下方各段追加到 ~/.config/clangd/config.yaml
+# 约定：源码解压到 /codebase/<项目>，与 Actions 构建路径一致
+# ============================================================================
+---
+If:
+  PathMatch: /codebase/ceph/.*
+CompileFlags:
+  CompilationDatabase: /codebase/ceph/build
+Index:
+  External:
+    File: /codebase/ceph/ceph.idx
+    MountPoint: /codebase/ceph
+---
+If:
+  PathMatch: /codebase/glusterfs/.*
+CompileFlags:
+  CompilationDatabase: /codebase/glusterfs
+Index:
+  External:
+    File: /codebase/glusterfs/glusterfs.idx
+    MountPoint: /codebase/glusterfs
+---
+If:
+  PathMatch: /codebase/moosefs/.*
+CompileFlags:
+  CompilationDatabase: /codebase/moosefs
+Index:
+  External:
+    File: /codebase/moosefs/moosefs.idx
+    MountPoint: /codebase/moosefs
+---
+If:
+  PathMatch: /codebase/braft/.*
+CompileFlags:
+  CompilationDatabase: /codebase/braft/build
+Index:
+  External:
+    File: /codebase/braft/braft.idx
+    MountPoint: /codebase/braft
+---
+If:
+  PathMatch: /codebase/kudu/.*
+CompileFlags:
+  CompilationDatabase: /codebase/kudu/build
+Index:
+  External:
+    File: /codebase/kudu/kudu.idx
+    MountPoint: /codebase/kudu
+---
+If:
+  PathMatch: /codebase/rocksdb/.*
+CompileFlags:
+  CompilationDatabase: /codebase/rocksdb/build
+Index:
+  External:
+    File: /codebase/rocksdb/rocksdb.idx
+    MountPoint: /codebase/rocksdb
+---
+If:
+  PathMatch: /codebase/leveldb/.*
+CompileFlags:
+  CompilationDatabase: /codebase/leveldb/build
+Index:
+  External:
+    File: /codebase/leveldb/leveldb.idx
+    MountPoint: /codebase/leveldb
